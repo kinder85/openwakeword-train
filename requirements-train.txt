@@ -1,0 +1,20 @@
+# openwakeword-train — entraînement de wake words custom (autonome, multilingue fr/en)
+# Installation : python -m pip install -r requirements-train.txt
+# (dépend de rien d'autre : le dépôt est autonome, plus besoin des requirements.txt de hapcvoice)
+# --- Runtime modèle / audio ---
+numpy
+soundfile
+sounddevice
+vosk
+openwakeword
+onnxruntime
+# --- Entraînement (génération TTS + augmentation + export onnx) ---
+edge-tts
+audiomentations
+onnx
+# --- Export .tflite (optionnel : quantisation int8 pour HA/ESP32/ESPHome) ---
+# Lourds (~600 Mo) — ne les installe QUE si tu as besoin du format .tflite.
+# Le fichier .onnx seul suffit sans ces deux dépendances. Pour les installer :
+#   python -m pip install "onnx2tf[tensorflow]" tf-keras
+# tensorflow
+# onnx2tf

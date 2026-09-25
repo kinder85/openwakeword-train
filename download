@@ -1,0 +1,14 @@
+# Modèles vosk (téléchargés par first_run.py, par langue) — non versionnés
+model/
+
+# Environnement virtuel local de validation
+.venv/
+
+# Données d'entraînement locales (TTS + découpes + onnx de travail)
+training_runs/
+
+# Réglages locaux de la GUI (langue d'interface, langue d'entraînement)
+trainer_settings.json
+
+__pycache__/
+*.pyc
