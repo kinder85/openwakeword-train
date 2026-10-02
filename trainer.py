@@ -357,7 +357,61 @@ def generate_samples(phrase, voices, n_per_voice, out_dir, progress_cb=None):
     return paths
 
 
-def generate_negatives(n, out_dir, lang="fr", voices=None, progress_cb=None):
+# Mots de remplissage par langue — insérés autour de la phrase cible pour
+# produire des négatifs confusants de façon générique (indépendante du wake word).
+FILLERS = {
+    "fr": ["y a", "il y a", "éveille", "attention", "dis", "hé", "alors", "bon", "écoute"],
+    "en": ["there is", "hey", "so", "well", "listen", "okay", "now"],
+}
+
+# Homophones/confusions courantes par mot (minuscules) — ressource réutilisable
+# appliquée à n'importe quelle phrase cible, pas une liste figée par wake word.
+HOMOPHONES = {
+    "fr": {
+        "yo": ["y a", "il y a", "yo-yo", "yoh", "joh"],
+        "ève": ["éveil", "éveille", "éveille-toi", "éva", "aime"],
+        "eve": ["eveil", "eveille", "eva", "even"],
+        "pixi": ["pixie", "pix", "pics", "pixy"],
+    },
+    "en": {
+        "eve": ["eveil", "eveille", "eva", "even"],
+        "hey": ["hay", "h", "aye", "eh"],
+        "pixi": ["pixie", "pix", "pics", "pixy"],
+    },
+}
+
+
+def confusable_negatives(phrase, lang="fr"):
+    """Dérive des variantes phonétiquement proches de la phrase cible, de façon
+    générique (marche pour n'importe quel wake word) :
+    - chaque mot seul (déclencheur partiel),
+    - ordre des mots inversé,
+    - mots de remplissage insérés avant/après,
+    - substitution homophone par mot (via HOMOPHONES, ressource par langue).
+    """
+    words = [w for w in phrase.split() if w]
+    if not words:
+        return []
+    variants = set()
+    # déclencheurs partiels : chaque mot seul
+    for w in words:
+        variants.add(w)
+    # ordre inversé
+    variants.add(" ".join(reversed(words)))
+    # mots de remplissage avant/après
+    for f in FILLERS.get(lang, []):
+        variants.add(f + " " + phrase)
+        variants.add(phrase + " " + f)
+    # substitution homophone par mot
+    for i, w in enumerate(words):
+        for h in HOMOPHONES.get(lang, {}).get(w.lower(), []):
+            v = list(words)
+            v[i] = h
+            variants.add(" ".join(v))
+    return sorted(variants)
+
+
+def generate_negatives(n, out_dir, lang="fr", voices=None, progress_cb=None, phrase=None):
     """Génère des clips négatifs (phrases non cibles de la langue) en WAV 16 kHz."""
     os.makedirs(out_dir, exist_ok=True)
     if lang not in NEGATIVE_SENTENCES:
@@ -366,10 +420,13 @@ def generate_negatives(n, out_dir, lang="fr", voices=None, progress_cb=None):
     if not voices:
         voices = [v for v, _ in list_voices(lang)]
     rng = random.Random(42)
-    sentences = [s for s in rng.sample(NEGATIVE_SENTENCES[lang],
-                                       min(n, len(NEGATIVE_SENTENCES[lang])))]
+    # les confusables dérivés de la phrase cible sont TOUJOURS inclus (en tête) ;
+    # la liste générique complète le quota jusqu'à n.
+    sentences = list(confusable_negatives(phrase, lang)) if phrase else []
+    base = NEGATIVE_SENTENCES[lang]
     while len(sentences) < n:
-        sentences.append(rng.choice(NEGATIVE_SENTENCES[lang]))
+        sentences.append(rng.choice(base))
+    sentences = sentences[:n]
     paths = []
     variants = list(PROSODY_VARIANTS)
     for i, sentence in enumerate(sentences[:n]):
@@ -402,6 +459,9 @@ def _make_noise_files(noise_dir):
 def make_augmenter(noise_dir):
     return Compose([
         AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.6),
+        # SNR remonté (10–30 dB au lieu de 0–15) + appliqué moins souvent :
+        # moins de sensibilité résiduelle → réduit les faux positifs en usage
+        # calme. Si les faux négatifs sous TV reviennent, re-baisser vers 0–15 dB.
         AddBackgroundNoise(noise_dir, min_snr_db=10, max_snr_db=30, p=0.5),
         PitchShift(min_semitones=-3, max_semitones=3, p=0.4),
         TimeStretch(min_rate=0.9, max_rate=1.1, p=0.4),
@@ -642,7 +702,7 @@ class WakeClassifier:
 
     # ---- entraînement (Adam, BCE)
     def fit(self, X, y, epochs=40, batch_size=128, lr=1e-3, wd=1e-4,
-            val_split=0.15, progress_cb=None, seed=0):
+            val_split=0.15, progress_cb=None, seed=0, neg_weight=1.0):
         rng = np.random.default_rng(seed)
         y = y.astype(np.float32)
         idx_val = rng.choice(len(y), size=max(8, int(len(y) * val_split)), replace=False)
@@ -680,10 +740,14 @@ class WakeClassifier:
                 h, z1, h1, z2, h2 = cache
                 p = 1.0 / (1.0 + np.exp(-logits))
                 eps = 1e-7
-                loss = -(yb * np.log(p + eps) + (1 - yb) * np.log(1 - p + eps)).mean()
+                # pondération de classe : les négatifs pèsent neg_weight× (réduit
+                # les faux positifs — cf. max_negative_weight de la méthode
+                # officielle openwakeword). neg_weight=1.0 = BCE classique.
+                w = np.where(yb == 1, 1.0, neg_weight)
+                loss = -(w * (yb * np.log(p + eps) + (1 - yb) * np.log(1 - p + eps))).mean()
                 total_loss += loss * len(yb)
 
-                dlogits = (p - yb) / len(yb)                     # (B,)
+                dlogits = (w * (p - yb)) / len(yb)                # (B,)
                 dW3 = dlogits[None, :] @ h2                      # (1, B) @ (B, 32)
                 db3 = dlogits.sum(keepdims=True)
                 dh2 = dlogits[:, None] * self.W3                 # (B, 32)
@@ -866,6 +930,7 @@ def export_tflite(onnx_path, calibration_X, out_path, model_name,
 REAL_AUDIO_DIR = os.path.join("training_runs", "_real_negatives")
 REAL_SPEECH_WAV = os.path.join(REAL_AUDIO_DIR, "real_speech_90s.wav")
 REAL_AMBIENT_WAV = os.path.join(REAL_AUDIO_DIR, "real_120s.wav")
+REAL_TV_WAV = os.path.join(REAL_AUDIO_DIR, "real_tv_120s.wav")
 
 
 def real_negative_paths():
@@ -879,7 +944,7 @@ def real_negative_paths():
     files = sorted(glob.glob(os.path.join(clips_dir, "real_*.wav")))
     if files:
         return files
-    sources = [p for p in (REAL_SPEECH_WAV, REAL_AMBIENT_WAV) if os.path.exists(p)]
+    sources = [p for p in (REAL_SPEECH_WAV, REAL_AMBIENT_WAV, REAL_TV_WAV) if os.path.exists(p)]
     if not sources:
         return []
     os.makedirs(clips_dir, exist_ok=True)
@@ -898,7 +963,7 @@ def real_negative_paths():
 
 def train_model(phrase, pos_paths, neg_paths, out_name, out_dir="openwakeword",
                 threshold=0.5, tokens=None, epochs=100, seed=0, progress_cb=None,
-                log_cb=None, with_tflite=True):
+                log_cb=None, with_tflite=True, neg_weight=1.0):
     """Pipeline complet : fenêtres → embeddings → entraînement → export .onnx + JSON.
 
     `with_tflite=False` : ne produit que le .onnx (pas de .tflite int8/float32),
@@ -931,7 +996,7 @@ def train_model(phrase, pos_paths, neg_paths, out_name, out_dir="openwakeword",
             % (info["epoch"], epochs, info["loss"], info["val_pos"], info["val_neg"]))
 
     log("Entraînement (%d epochs)…" % epochs)
-    model.fit(X, y, epochs=epochs, progress_cb=cb, seed=seed)
+    model.fit(X, y, epochs=epochs, progress_cb=cb, seed=seed, neg_weight=neg_weight)
 
     onnx_path = os.path.join(out_dir, out_name + ".onnx")
     log("Export : " + onnx_path)
@@ -1050,6 +1115,7 @@ if __name__ == "__main__":
     pos = generate_samples(phrase, voices, 8, os.path.join(run_dir, "positives"),
                            progress_cb=lambda d, t, p: print("  %d/%d" % (d, t)))
     print("génération des négatifs… (lang=%s)" % lang)
-    neg = generate_negatives(30, os.path.join(run_dir, "negatives"), lang)
+    neg = generate_negatives(30, os.path.join(run_dir, "negatives"), lang,
+                             phrase=phrase)
     res = train_model(phrase, pos, neg, stem, log_cb=print)
     print(res)

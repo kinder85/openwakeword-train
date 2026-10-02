@@ -59,9 +59,10 @@ python first_run_train.py --lang fr     # or en, de, es
 ```
 
 Installs the packages, downloads the models (vosk of the language +
-openWakeWord), then asks for **two real microphone recordings**:
+openWakeWord), then asks for **real microphone recordings**:
 - 90 s where you read an on-screen text (real speech);
-- 120 s of silence (room ambience).
+- 120 s of silence (room ambience);
+- 120 s of TV / real-noise ambience (optional, to reject background noise).
 
 These recordings become the **real negatives** and the background-noise
 context for the positives — this is what removes false positives in real use.
@@ -80,6 +81,11 @@ Three steps:
    transcription is shown as a check (model of the chosen language);
 3. **train and export** → `.onnx` + JSON in `openwakeword/` (and, if the
    **« produce .tflite »** box is checked, the int8 + float32 `.tflite`).
+
+> **Tip**: select **multiple TTS voices** and a generous number of samples.
+> The more voices × prosody variants the model sees, the more robust it is
+> and the fewer false positives it produces (the official method recommends
+> tens of thousands of samples — here, every sample counts).
 
 A **4th step** lets you convert an existing `.onnx` to `.tflite`
 (int8 + float32) without re-running training: pick the `.onnx` file (and
@@ -145,6 +151,26 @@ Each training produces in `openwakeword/`:
   calibration** (auto-reused by `onnx_to_tflite.py`);
 - `<name>.json` — metadata (`label`, `phrase`, `threshold`).
 
+## Reducing false positives
+
+Levers from practice and from the official openWakeWord method:
+
+- **Real negatives** (the most important): record real speech plus real
+  ambience with the microphone (`first_run_train.py`; for the specific TV
+  ambience, `capture_ambiance_tv.py`). Without them, the model cannot reject
+  the real world.
+- **Class weighting**: `train_model(..., neg_weight=N)` (default 1.0) weights
+  the negatives in the BCE → the model becomes conservative (fewer false
+  positives). The official method uses a high `max_negative_weight`.
+- **The pause**: putting a comma in the target phrase (« hey, pixie ») forces
+  edge-tts to insert a pause. The model learns the `word → pause → word`
+  structure and triggers far less on a single word (« hey » or « pixie »
+  alone no longer suffice).
+- **Confusables**: phonetic variants (single words, reversed order,
+  homophones) are automatically derived from the target phrase as negatives.
+- **Runtime threshold**: tune the `threshold` of the wake word entity (and the
+  consecutive-frame count) — the sensitivity / false-positive trade-off.
+
 ## `.tflite` format (Home Assistant / ESPHome / ESP32)
 
 The `.tflite` is generated automatically at the end of training, in **two
@@ -175,6 +201,7 @@ trainer_gui.py        bilingual graphical interface (fr/en)
 onnx_to_tflite.py     .onnx → .tflite conversion (int8 + float32) post-training
 first_run.py          download of missing models (vosk per language + openWakeWord)
 first_run_train.py    first run: packages + models + real recordings + split
+capture_ambiance_tv.py capture of real TV/background noise (real negatives)
 vosk_helper.py        vosk model lookup per language + transcription
 requirements-train.txt  all dependencies (single install)
 model/                vosk models per language (git-ignored, downloaded)

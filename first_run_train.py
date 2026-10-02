@@ -7,6 +7,7 @@
    positifs en usage réel :
      - 90 s : lis le texte affiché à voix haute (parole réelle)
      - 120 s : reste silencieux (ambiance de la pièce)
+     - 120 s (optionnel) : ambiance TV / bruit réel, pour rejeter le bruit
    Ces enregistrements servent de négatifs réels ET de fond sonore
    contextuel pour les positifs (cf. trainer.py). Ignorés si déjà présents.
 4. Découpage des enregistrements en clips négatifs (mis en cache).
@@ -255,21 +256,52 @@ def record_ambient(lang="fr"):
     return True
 
 
+def record_tv_noise(lang="fr"):
+    print("\n" + "=" * 70)
+    print("ENREGISTREMENT 3 — AMBIANCE TV / BRUIT RÉEL (120 s) [lang=%s]" % lang)
+    print("=" * 70)
+    print("Allume la TV (dialogue + musique) ou laisse un bruit de fond réel.")
+    print("Reste SILENCIEUX pendant 2 minutes — on enregistre le bruit ambiant.")
+    print("Cela apprend au modèle à rejeter le bruit réel (faux positifs).")
+    input("Allume la TV, puis Entrée pour démarrer… ")
+    countdown(5, "départ")
+    print("● TV/BRUIT — ambiance réelle (120 s)…", flush=True)
+    path, data = record(120)
+    rms = rms_profile(data, 48000)
+    med = float(np.median(rms))
+    print("… terminé — RMS médian %.4f, max %.4f" % (med, float(rms.max())))
+    if med < 0.002:
+        print("⚠ très peu de signal — vérifie que la TV est allumée et le micro actif")
+    os.replace(path, os.path.join("training_runs", "_real_negatives", "real_tv_120s.wav"))
+    print("✓ Ambiance TV/bruit enregistrée : real_tv_120s.wav")
+    return True
+
+
 def ensure_real_audio(lang="fr"):
     os.makedirs(os.path.join("training_runs", "_real_negatives"), exist_ok=True)
     have_speech = os.path.exists(os.path.join("training_runs", "_real_negatives", "real_speech_90s.wav"))
     have_ambient = os.path.exists(os.path.join("training_runs", "_real_negatives", "real_120s.wav"))
+    have_tv = os.path.exists(os.path.join("training_runs", "_real_negatives", "real_tv_120s.wav"))
     if have_speech and have_ambient:
         print("[3/4] Enregistrements réels du micro : déjà présents")
-        return True
-    print("[3/4] Enregistrements réels du micro : manquants — nécessaires pour")
-    print("      éliminer les faux positifs (négatifs réels + contexte des positifs).")
-    if not have_speech:
-        if not record_speech(lang):
-            return False
-    if not have_ambient:
-        if not record_ambient(lang):
-            return False
+    else:
+        print("[3/4] Enregistrements réels du micro : manquants — nécessaires pour")
+        print("      éliminer les faux positifs (négatifs réels + contexte des positifs).")
+        if not have_speech:
+            if not record_speech(lang):
+                return False
+        if not have_ambient:
+            if not record_ambient(lang):
+                return False
+    # 3e enregistrement optionnel : ambiance TV / bruit réel (rejet du bruit)
+    if not have_tv:
+        try:
+            rep = input("Veux-tu enregistrer l'ambiance TV/bruit (pour rejeter le bruit réel) ? [o/N] ").strip().lower()
+        except EOFError:
+            rep = ""
+        if rep in ("o", "oui", "y", "yes"):
+            if not record_tv_noise(lang):
+                return False
     return True
 
 

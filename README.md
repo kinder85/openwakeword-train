@@ -60,9 +60,10 @@ python first_run_train.py --lang fr     # ou en, de, es
 ```
 
 Installe les paquets, télécharge les modèles (vosk de la langue + openWakeWord),
-puis demande **deux enregistrements réels au micro** :
+puis demande **des enregistrements réels au micro** :
 - 90 s où tu lis un texte affiché (parole réelle) ;
-- 120 s de silence (ambiance de la pièce).
+- 120 s de silence (ambiance de la pièce) ;
+- 120 s d'ambiance TV / bruit réel (optionnel, pour rejeter le bruit).
 
 Ces enregistrements deviennent les **négatifs réels** et le fond sonore de
 contexte des positifs — c'est ce qui élimine les faux positifs en usage réel.
@@ -81,6 +82,11 @@ Trois étapes :
    transcription vosk s'affiche en contrôle (modèle de la langue choisie) ;
 3. **entraîner et exporter** → `.onnx` + JSON dans `openwakeword/` (et, si la
    case **« produire les .tflite »** est cochée, les `.tflite` int8 + float32).
+
+> **Astuce** : sélectionne **plusieurs voix TTS** et un nombre d'échantillons
+> généreux. Plus le modèle voit de voix × prosodies différentes, plus il est
+> robuste et moins il fait de faux positifs (la méthode officielle recommande
+> des dizaines de milliers d'échantillons — ici, tout échantillon compte).
 
 Une **4e étape** permet de convertir un `.onnx` existant en `.tflite`
 (int8 + float32) sans relancer l'entraînement : choisis le fichier `.onnx`
@@ -148,6 +154,25 @@ Chaque entraînement produit dans `openwakeword/` :
   **calibration int8** (réutilisés automatiquement par `onnx_to_tflite.py`) ;
 - `<nom>.json` — métadonnées (`label`, `phrase`, `threshold`).
 
+## Réduire les faux positifs
+
+Leviers issus de la pratique et de la méthode officielle openWakeWord :
+
+- **Négatifs réels** (le plus important) : enregistre de la vraie parole + de la
+  vraie ambiance au micro (`first_run_train.py` ; pour l'ambiance TV spécifique,
+  `capture_ambiance_tv.py`). Sans eux, le modèle ne sait pas rejeter le réel.
+- **Pondération de classe** : `train_model(..., neg_weight=N)` (défaut 1.0)
+  pondère les négatifs dans la BCE → le modèle devient conservateur (moins de
+  faux positifs). La méthode officielle utilise un `max_negative_weight` élevé.
+- **La pause** : mettre une virgule dans la phrase cible (« hey, pixie ») force
+  edge-tts à insérer une pause. Le modèle apprend la structure
+  `mot → pause → mot` et déclenche bien moins sur un mot seul (« hey » ou
+  « pixie » isolés ne suffisent plus).
+- **Confusibles** : les variantes phonétiques (mots seuls, ordre inversé,
+  homophones) sont dérivées automatiquement de la phrase cible en négatifs.
+- **Seuil au runtime** : régler le `threshold` de l'entité wake word (et le
+  nombre de trames consécutives) — le compromis sensibilité / faux positifs.
+
 ## Format `.tflite` (Home Assistant / ESPHome / ESP32)
 
 Le `.tflite` est généré automatiquement en fin d'entraînement, en **deux
@@ -178,6 +203,7 @@ trainer_gui.py        interface graphique bilingue (fr/en)
 onnx_to_tflite.py     conversion .onnx → .tflite (int8 + float32) post-création
 first_run.py          téléchargement des modèles absents (vosk par langue + openWakeWord)
 first_run_train.py    first run : paquets + modèles + enregistrements réels + découpage
+capture_ambiance_tv.py capture d'ambiance TV/bruit réelle (négatifs réels)
 vosk_helper.py        lookup du modèle vosk par langue + transcription
 requirements-train.txt  toutes les dépendances (installation seule)
 model/                modèles vosk par langue (ignoré par git, téléchargés)

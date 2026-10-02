@@ -20,6 +20,7 @@ Usage : python trainer_gui.py
 import os
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -87,6 +88,12 @@ UI_STRINGS = {
         "conv_ok": "✓ Conversion terminée — .tflite dans {dir}",
         "conv_failed": "✗ conversion : {kind}: {err}",
         "conv_missing_deps": "✗ onnx2tf absent — installe `pip install onnx2tf[tensorflow] tf-keras`",
+        "amb_title": "Ambiance TV (recommandé)",
+        "amb_btn": "Enregistrer l'ambiance TV",
+        "amb_ready": "Allume la TV (dialogue + musique), reste SILENCIEUX.\n\nLe wake word sera entraîné à être entendu PAR-DESSUS ce bruit.\n\nClique OK quand la TV est allumée et que tu es prêt(e).",
+        "amb_recording": "Enregistrement ambiance TV ({dur} s)…",
+        "amb_done": "✓ Ambiance TV enregistrée — sera utilisée au prochain entraînement (contexte positifs + négatifs réels).",
+        "amb_failed": "✗ capture ambiance : {kind}: {err}",
     },
     "en": {
         "win_title": "Wake word training",
@@ -132,6 +139,12 @@ UI_STRINGS = {
         "conv_ok": "✓ Conversion done — .tflite in {dir}",
         "conv_failed": "✗ conversion: {kind}: {err}",
         "conv_missing_deps": "✗ onnx2tf missing — install `pip install onnx2tf[tensorflow] tf-keras`",
+        "amb_title": "TV ambience (recommended)",
+        "amb_btn": "Record TV ambience",
+        "amb_ready": "Turn the TV on (speech + music), stay SILENT.\n\nThe wake word will be trained to be heard OVER this noise.\n\nClick OK when the TV is on and you are ready.",
+        "amb_recording": "Recording TV ambience ({dur} s)…",
+        "amb_done": "✓ TV ambience recorded — will be used at next training (positive context + real negatives).",
+        "amb_failed": "✗ ambience capture: {kind}: {err}",
     },
 }
 
@@ -315,6 +328,18 @@ class TrainerApp:
                                    bg=COL_WAKE, fg="#161006",
                                    font=("Segoe UI", 10, "bold"), relief="flat", padx=10)
         self.train_btn.pack(side="right")
+
+        # --- ambiance TV (contexte des positifs + négatifs réels) ---
+        p_amb = tk.Frame(self.root, bg=PANEL)
+        p_amb.pack(fill="x", padx=10, pady=6)
+        row_amb = tk.Frame(p_amb, bg=PANEL)
+        row_amb.pack(fill="x", padx=10, pady=8)
+        tk.Label(row_amb, text=self._tt("amb_title"), font=("Segoe UI", 10, "bold"),
+                 fg=FG, bg=PANEL).pack(side="left")
+        self.amb_btn = tk.Button(row_amb, text=self._tt("amb_btn"), command=self.record_ambiance,
+                                 bg=COL_LISTEN, fg="#0b0f14",
+                                 font=("Segoe UI", 10, "bold"), relief="flat", padx=10)
+        self.amb_btn.pack(side="right")
 
         # --- étape 4 : conversion .onnx → .tflite (post-création) ---
         p4 = tk.Frame(self.root, bg=PANEL)
@@ -535,7 +560,7 @@ class TrainerApp:
                     self.ui_q.put(("log_k", "gen_negatives"))
                     self.negatives = tr.generate_negatives(
                         nneg, os.path.join(run_dir, "negatives"),
-                        lang=self.lang_var.get())
+                        lang=self.lang_var.get(), phrase=phrase)
                 res = tr.train_model(phrase, self.samples, self.negatives, name,
                                      threshold=threshold, log_cb=log_cb,
                                      with_tflite=self.tflite_var.get())
@@ -555,6 +580,38 @@ class TrainerApp:
         self._log_k("exported", v=verdict, name=self._model_name())
         self._log_k("gap", gap=gap,
                     qual=self._tt("gap_good") if gap > 0.6 else self._tt("gap_weak"))
+
+    # ---------------- ambiance TV (contexte + négatifs réels) ----------------
+    def record_ambiance(self):
+        from tkinter import messagebox
+        dur = 120
+        if not messagebox.askokcancel(self._tt("amb_title"), self._tt("amb_ready")):
+            return
+        self.amb_btn.config(state="disabled")
+        self._progress_start("indeterminate", label=self._tt("amb_recording", dur=dur))
+
+        def log_cb(msg):
+            self.ui_q.put(("log", msg))
+
+        def worker():
+            try:
+                import capture_ambiance_tv as cap
+                for i in range(5, 0, -1):
+                    log_cb("  %d…" % i)
+                    time.sleep(1)
+                med, mx = cap.capture(dur, log_cb=log_cb)
+                self.ui_q.put(("amb_done", med, mx))
+            except Exception as e:
+                self.ui_q.put(("log_k", "amb_failed", {"kind": type(e).__name__, "err": e}))
+                self.ui_q.put(("amb_done", None, None))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_ambiance(self, med, mx):
+        self.amb_btn.config(state="normal")
+        self._progress_stop()
+        if med is None:
+            return
+        self._log_k("amb_done")
 
     # ---------------- conversion .onnx → .tflite ----------------
     def _browse_onnx(self):
@@ -627,6 +684,8 @@ class TrainerApp:
                     self.transcript_var.set(item[1])
                 elif kind == "trained":
                     self._after_train(item[1])
+                elif kind == "amb_done":
+                    self._after_ambiance(item[1], item[2])
                 elif kind == "conv_done":
                     self._after_convert(item[1], item[2])
         except queue.Empty:
