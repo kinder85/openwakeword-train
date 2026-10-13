@@ -22,7 +22,8 @@ import time
 import numpy as np
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-os.chdir(SCRIPT_DIR)
+# NB : le chdir est fait dans main() — PAS à l'import, pour que le module reste
+# importable sans effet de bord (trainer_gui.py utilise download_oww_features).
 
 TEXTE_A_LIRE = {
     "fr": """Le wake word est la porte d'entrée de l'assistant vocal. Il écoute en
@@ -114,9 +115,9 @@ def ensure_packages():
     needed = [("edge_tts", "edge-tts"), ("audiomentations", "audiomentations"), ("onnx", "onnx")]
     missing = [pkg for mod, pkg in needed if not _importable(mod)]
     if not missing:
-        print("[1/4] Paquets d'entraînement : déjà présents")
+        print("[1/5] Paquets d'entraînement : déjà présents")
         return True
-    print("[1/4] Installation des paquets manquants : %s" % ", ".join(missing))
+    print("[1/5] Installation des paquets manquants : %s" % ", ".join(missing))
     import subprocess
     try:
         subprocess.check_call(_pip_cmd() + missing)
@@ -283,9 +284,9 @@ def ensure_real_audio(lang="fr"):
     have_ambient = os.path.exists(os.path.join("training_runs", "_real_negatives", "real_120s.wav"))
     have_tv = os.path.exists(os.path.join("training_runs", "_real_negatives", "real_tv_120s.wav"))
     if have_speech and have_ambient:
-        print("[3/4] Enregistrements réels du micro : déjà présents")
+        print("[3/5] Enregistrements réels du micro : déjà présents")
     else:
-        print("[3/4] Enregistrements réels du micro : manquants — nécessaires pour")
+        print("[3/5] Enregistrements réels du micro : manquants — nécessaires pour")
         print("      éliminer les faux positifs (négatifs réels + contexte des positifs).")
         if not have_speech:
             if not record_speech(lang):
@@ -305,8 +306,136 @@ def ensure_real_audio(lang="fr"):
     return True
 
 
+# ------------------------------------- négatifs génériques openWakeWord
+# Dataset public davidscripka/openwakeword_features : features déjà calculées par
+# l'embedding Google, au format exact d'entrée du modèle (16, 96). C'est LE levier
+# contre les faux positifs (~150 -> ~200 000 fenêtres de négatifs réels variés).
+OWW_DATASET = ("https://huggingface.co/datasets/davidscripka/"
+               "openwakeword_features/resolve/main")
+OWW_ACAV_URL = OWW_DATASET + "/openwakeword_features_ACAV100M_2000_hrs_16bit.npy"
+OWW_VAL_URL = OWW_DATASET + "/validation_set_features.npy"
+OWW_ROWS_DEFAUT = 200000
+
+
+def _entete_npy(url):
+    """Offset des données d'un .npy distant (en-tête lu par une requête Range)."""
+    import struct
+    import urllib.request
+    req = urllib.request.Request(url, headers={"Range": "bytes=0-255"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        head = r.read(256)
+    if head[:6] != b"\x93NUMPY":
+        raise RuntimeError("en-tête .npy inattendu")
+    maj, mino = head[6], head[7]
+    if (maj, mino) == (1, 0):
+        hlen = struct.unpack("<H", head[8:10])[0]
+        return 10 + hlen
+    hlen = struct.unpack("<I", head[8:12])[0]
+    return 12 + hlen
+
+
+def _telecharger(url, chemin, headers=None, label=""):
+    """Télécharge (en flux, avec progression) vers `chemin`. Renvoie les octets."""
+    import urllib.request
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=180) as r, open(chemin, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        fait = 0
+        while True:
+            bloc = r.read(1024 * 1024)
+            if not bloc:
+                break
+            f.write(bloc)
+            fait += len(bloc)
+            if total:
+                print("\r  %-11s %5.1f%% (%.0f/%.0f Mo)" % (
+                    label, 100.0 * fait / total, fait / 1e6, total / 1e6),
+                    end="", flush=True)
+    print()
+    return fait
+
+
+def download_oww_features(n_rows=OWW_ROWS_DEFAUT, dest=None):
+    """Télécharge un sous-ensemble des négatifs génériques openWakeWord (ACAV100M,
+    ~2000 h, stockées float16) + le jeu de validation faux positifs (~11 h).
+
+    Astuce : le .npy est en ordre C -> une requête HTTP Range sur la TÊTE suffit
+    (pas besoin des 17 Go complets) ; l'en-tête est ensuite réécrit pour la forme
+    tronquée. Renvoie True si les deux fichiers sont là.
+    """
+    if dest is None:
+        import trainer
+        dest = trainer.OWW_FEATURES_DIR
+    os.makedirs(dest, exist_ok=True)
+    acav = os.path.join(dest, "acav100m_200k.npy")
+    val = os.path.join(dest, "validation_set_features.npy")
+
+    if not os.path.exists(acav):
+        off = _entete_npy(OWW_ACAV_URL)
+        nbytes = off + n_rows * 16 * 96 * 2
+        print("  ACAV100M : %d fenêtres (~%.0f h) — ~%.0f Mo"
+              % (n_rows, n_rows * 16 / 12.5 / 3600.0, nbytes / 1e6))
+        tmp = acav + ".part"
+        _telecharger(OWW_ACAV_URL, tmp,
+                     {"Range": "bytes=0-%d" % (nbytes - 1)}, "ACAV100M")
+        with open(tmp, "rb") as f:
+            f.seek(off)
+            buf = f.read(n_rows * 16 * 96 * 2)
+        arr = np.frombuffer(buf, dtype="<f2").reshape(n_rows, 16, 96)
+        with open(acav, "wb") as g:
+            np.lib.format.write_array(g, arr, allow_pickle=False)
+        os.remove(tmp)
+    else:
+        print("  ACAV100M : déjà présent")
+
+    if not os.path.exists(val):
+        print("  Jeu de validation faux positifs (~11 h) — ~185 Mo")
+        _telecharger(OWW_VAL_URL, val, None, "validation")
+    else:
+        print("  Jeu de validation : déjà présent")
+    return os.path.exists(acav) and os.path.exists(val)
+
+
+def ensure_oww_features(force=None, n_rows=OWW_ROWS_DEFAUT):
+    """Étape first-run : négatifs génériques openWakeWord (recommandé).
+
+    `force=True` télécharge sans demander ; `force=None` pose la question.
+    Renvoie True si les features sont disponibles.
+    """
+    import trainer
+    if os.path.exists(trainer.OWW_ACAV_NPY) and os.path.exists(trainer.OWW_VALIDATION_NPY):
+        print("[4/5] Négatifs génériques openWakeWord : déjà présents (%s)"
+              % trainer.OWW_FEATURES_DIR)
+        return True
+    print("\n" + "=" * 70)
+    print("NÉGATIFS GÉNÉRIQUES openWakeWord (recommandé)")
+    print("=" * 70)
+    print("Des features déjà calculées par l'embedding (ACAV100M, ~2000 h d'audio")
+    print("réel) que l'on ajoute aux négatifs : c'est LE levier contre les faux")
+    print("positifs (de ~150 à ~200 000 fenêtres). Téléchargement ~800 Mo, une fois.")
+    if force is None:
+        try:
+            rep = input("Télécharger les négatifs génériques openWakeWord ? [O/n] ").strip().lower()
+        except EOFError:
+            rep = ""
+        if rep in ("n", "non", "no"):
+            print("→ ignoré (entraînement possible sans, mais plus de faux positifs).")
+            return False
+    print("[4/5] Téléchargement des négatifs génériques openWakeWord…")
+    try:
+        ok = download_oww_features(n_rows=n_rows)
+    except Exception as e:
+        print("✗ téléchargement échoué : %s" % e)
+        print("  (l'entraînement reste possible sans — relance ce script plus tard.)")
+        return False
+    if ok:
+        print("[4/5] ✓ Négatifs génériques prêts (%s)" % trainer.OWW_FEATURES_DIR)
+    return ok
+
+
 # ---------------------------------------------------------------- main
 def main(argv=None):
+    os.chdir(SCRIPT_DIR)   # chemins relatifs (model/, training_runs/) ancrés au dépôt
     import argparse
     import first_run
     parser = argparse.ArgumentParser(
@@ -319,6 +448,13 @@ def main(argv=None):
                             help="installer les dépendances .tflite (HA/ESPHome/ESP32) sans demander")
     tflite_grp.add_argument("--no-tflite", action="store_true",
                             help="ne pas installer les dépendances .tflite")
+    oww_grp = parser.add_mutually_exclusive_group()
+    oww_grp.add_argument("--oww", action="store_true",
+                         help="télécharger les négatifs génériques openWakeWord sans demander")
+    oww_grp.add_argument("--no-oww", action="store_true",
+                         help="ne pas télécharger les négatifs génériques openWakeWord")
+    parser.add_argument("--oww-rows", type=int, default=OWW_ROWS_DEFAUT,
+                        help="fenêtres ACAV100M à télécharger (défaut %d)" % OWW_ROWS_DEFAUT)
     args = parser.parse_args(argv)
     lang = args.lang
     print("=" * 70)
@@ -334,21 +470,27 @@ def main(argv=None):
         pass
     if not first_run.ensure_models(locale=lang):
         sys.exit(1)
-    print("[2/4] Modèles vosk + openWakeWord : prêts (lang=%s)" % lang)
+    print("[2/5] Modèles vosk + openWakeWord : prêts (lang=%s)" % lang)
 
     if not ensure_real_audio(lang):
         sys.exit(1)
-    print("[3/4] Enregistrements réels : prêts (lang=%s)" % lang)
+    print("[3/5] Enregistrements réels : prêts (lang=%s)" % lang)
+
+    if args.no_oww:
+        print("[4/5] négatifs génériques openWakeWord ignorés (--no-oww)")
+    else:
+        ensure_oww_features(force=True if args.oww else None, n_rows=args.oww_rows)
 
     import trainer
     clips = trainer.real_negative_paths()
     if not clips:
-        print("[4/4] ✗ aucun clip réel produit — vérifie training_runs/_real_negatives/")
+        print("[4/5] ✗ aucun clip réel produit — vérifie training_runs/_real_negatives/")
         sys.exit(1)
-    print("[4/4] Clips négatifs réels : %d (training_runs/_real_negatives/clips/)" % len(clips))
+    print("[4/5] Clips négatifs réels : %d (training_runs/_real_negatives/clips/)" % len(clips))
 
-    print("\n✓ Prêt. Lance python trainer_gui.py — les négatifs réels seront")
-    print("  inclus automatiquement dans chaque entraînement.")
+    print("\n✓ Prêt. Lance python trainer_gui.py — les négatifs réels ET les")
+    print("  négatifs génériques openWakeWord seront inclus automatiquement dans")
+    print("  chaque entraînement (cf. trainer.OWW_FEATURES_DIR).")
 
 
 if __name__ == "__main__":

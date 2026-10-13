@@ -94,6 +94,16 @@ UI_STRINGS = {
         "amb_recording": "Enregistrement ambiance TV ({dur} s)…",
         "amb_done": "✓ Ambiance TV enregistrée — sera utilisée au prochain entraînement (contexte positifs + négatifs réels).",
         "amb_failed": "✗ capture ambiance : {kind}: {err}",
+        "oww_title": "Négatifs génériques openWakeWord",
+        "oww_rows": "fenêtres",
+        "oww_check": "Vérifier l'état",
+        "oww_download": "Télécharger (~800 Mo)",
+        "oww_present": "✓ présents — {rows} fenêtres (~{h} h, {mo} Mo)",
+        "oww_partial": "⚠ incomplets — relance le téléchargement",
+        "oww_absent": "✗ absents — à télécharger une fois (recommandé)",
+        "oww_downloading": "Téléchargement des négatifs génériques openWakeWord…",
+        "oww_done": "✓ Négatifs génériques prêts ({dir}) — inclus automatiquement aux prochains entraînements.",
+        "oww_failed": "✗ téléchargement négatifs : {kind}: {err}",
     },
     "en": {
         "win_title": "Wake word training",
@@ -145,6 +155,16 @@ UI_STRINGS = {
         "amb_recording": "Recording TV ambience ({dur} s)…",
         "amb_done": "✓ TV ambience recorded — will be used at next training (positive context + real negatives).",
         "amb_failed": "✗ ambience capture: {kind}: {err}",
+        "oww_title": "openWakeWord generic negatives",
+        "oww_rows": "frames",
+        "oww_check": "Check status",
+        "oww_download": "Download (~800 MB)",
+        "oww_present": "✓ present — {rows} frames (~{h} h, {mo} MB)",
+        "oww_partial": "⚠ incomplete — re-run the download",
+        "oww_absent": "✗ missing — download once (recommended)",
+        "oww_downloading": "Downloading openWakeWord generic negatives…",
+        "oww_done": "✓ Generic negatives ready ({dir}) — automatically included in future trainings.",
+        "oww_failed": "✗ negatives download: {kind}: {err}",
     },
 }
 
@@ -329,6 +349,30 @@ class TrainerApp:
                                    font=("Segoe UI", 10, "bold"), relief="flat", padx=10)
         self.train_btn.pack(side="right")
 
+        # --- négatifs génériques openWakeWord (ACAV100M) : levier anti-faux-positifs ---
+        p_oww = tk.Frame(self.root, bg=PANEL)
+        p_oww.pack(fill="x", padx=10, pady=6)
+        row_oww = tk.Frame(p_oww, bg=PANEL)
+        row_oww.pack(fill="x", padx=10, pady=8)
+        tk.Label(row_oww, text=self._tt("oww_title"), font=("Segoe UI", 10, "bold"),
+                 fg=FG, bg=PANEL).pack(side="left")
+        self.oww_status_var = tk.StringVar(value="")
+        tk.Label(row_oww, textvariable=self.oww_status_var, fg=FG_DIM, bg=PANEL,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(10, 0))
+        self.oww_btn = tk.Button(row_oww, text=self._tt("oww_download"),
+                                 command=self.download_oww, bg=COL_LISTEN, fg="#0b0f14",
+                                 font=("Segoe UI", 10, "bold"), relief="flat", padx=10)
+        self.oww_btn.pack(side="right")
+        tk.Button(row_oww, text=self._tt("oww_check"), command=self.check_oww,
+                  bg=PANEL, fg=FG, relief="flat", padx=8).pack(side="right", padx=6)
+        self.oww_rows_var = tk.IntVar(value=200000)
+        tk.Spinbox(row_oww, from_=10000, to=1000000, increment=10000,
+                   textvariable=self.oww_rows_var, width=8, bg=BG, fg=FG,
+                   insertbackground=FG, relief="flat",
+                   buttonbackground=PANEL).pack(side="right", padx=6)
+        tk.Label(row_oww, text=self._tt("oww_rows"), fg=FG_DIM, bg=PANEL,
+                 font=("Segoe UI", 8)).pack(side="right", padx=(8, 2))
+
         # --- ambiance TV (contexte des positifs + négatifs réels) ---
         p_amb = tk.Frame(self.root, bg=PANEL)
         p_amb.pack(fill="x", padx=10, pady=6)
@@ -384,6 +428,7 @@ class TrainerApp:
         self.log.tag_config("default", foreground=FG)
         self.log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self._log_k("ready_tip")
+        self.check_oww()               # état des négatifs génériques openWakeWord
 
         self._apply_ui_lang()          # applique langue d'affichage aux libellés dynamiques
         self.lang_var.set(self._lang_train_saved)  # restaure langue d'entraînement
@@ -659,6 +704,55 @@ class TrainerApp:
         if ok:
             self._log_k("conv_ok", dir=out_dir)
 
+    # ---------------- négatifs génériques openWakeWord ----------------
+    def _oww_files(self):
+        return (tr.OWW_ACAV_NPY, tr.OWW_VALIDATION_NPY)
+
+    def check_oww(self):
+        """Rafraîchit l'état des négatifs génériques (présents / incomplets / absents)."""
+        acav, val = self._oww_files()
+        a_ok, v_ok = os.path.exists(acav), os.path.exists(val)
+        if a_ok and v_ok:
+            try:
+                n = int(np.load(acav, mmap_mode="r").shape[0])
+            except Exception:
+                n = 0
+            mo = (os.path.getsize(acav) + os.path.getsize(val)) / 1e6
+            self.oww_status_var.set(self._tt(
+                "oww_present", rows="%d" % n,
+                h="%.0f" % (n * 16 / 12.5 / 3600.0), mo="%.0f" % mo))
+        elif a_ok or v_ok:
+            self.oww_status_var.set(self._tt("oww_partial"))
+        else:
+            self.oww_status_var.set(self._tt("oww_absent"))
+
+    def download_oww(self):
+        """Télécharge les négatifs génériques (ACAV100M + validation) en tâche de fond."""
+        self.oww_btn.config(state="disabled")
+        rows = int(self.oww_rows_var.get())
+        self._progress_start("indeterminate", label=self._tt("oww_downloading"))
+
+        def log_cb(msg):
+            self.ui_q.put(("log", msg))
+
+        def worker():
+            try:
+                import first_run_train as frt
+                ok = frt.download_oww_features(n_rows=rows)
+                self.ui_q.put(("oww_done", bool(ok)))
+            except Exception as e:
+                self.ui_q.put(("log_k", "oww_failed",
+                               {"kind": type(e).__name__, "err": e}))
+                self.ui_q.put(("oww_done", False))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_oww(self, ok):
+        self.oww_btn.config(state="normal")
+        self._progress_stop()
+        self.check_oww()
+        if ok:
+            self._log_k("oww_done", dir=tr.OWW_FEATURES_DIR)
+
     # ---------------- boucle UI ----------------
     def _drain(self):
         try:
@@ -688,6 +782,8 @@ class TrainerApp:
                     self._after_ambiance(item[1], item[2])
                 elif kind == "conv_done":
                     self._after_convert(item[1], item[2])
+                elif kind == "oww_done":
+                    self._after_oww(item[1])
         except queue.Empty:
             pass
         self.root.after(80, self._drain)

@@ -69,6 +69,15 @@ Ces enregistrements deviennent les **négatifs réels** et le fond sonore de
 contexte des positifs — c'est ce qui élimine les faux positifs en usage réel.
 Ils ne sont demandés qu'une fois et réutilisés par tous les entraînements.
 
+Le script propose ensuite de télécharger les **négatifs génériques openWakeWord**
+(features pré-calculées d'ACAV100M, ~2000 h d'audio réel varié) — ~800 Mo, une
+seule fois. C'est de loin le meilleur levier contre les faux positifs : on passe
+de quelques centaines de négatifs à ~200 000, sans rien encoder soi-même.
+Refuser reste possible (`--no-oww`) ; forcer sans question : `--oww` ; ajuster la
+quantité : `--oww-rows 100000`. Dossier : `openwakeword_features/` (jamais purgé).
+Détails, dépannage et re-téléchargement manuel :
+[`docs/NEGATIFS-OPENWAKEWORD.md`](docs/NEGATIFS-OPENWAKEWORD.md) (ou la GUI, panneau dédié).
+
 ### Interface graphique
 
 ```bash
@@ -202,7 +211,8 @@ trainer.py            pipeline complet (génération → embeddings → entraîn
 trainer_gui.py        interface graphique bilingue (fr/en)
 onnx_to_tflite.py     conversion .onnx → .tflite (int8 + float32) post-création
 first_run.py          téléchargement des modèles absents (vosk par langue + openWakeWord)
-first_run_train.py    first run : paquets + modèles + enregistrements réels + découpage
+first_run_train.py    first run : paquets + modèles + enregistrements réels + négatifs génériques openWakeWord + découpage
+telecharger_negatifs_openwakeword.py  (re)téléchargement des négatifs génériques (ACAV100M) — cf. docs/NEGATIFS-OPENWAKEWORD.md
 capture_ambiance_tv.py capture d'ambiance TV/bruit réelle (négatifs réels)
 vosk_helper.py        lookup du modèle vosk par langue + transcription
 requirements-train.txt  toutes les dépendances (installation seule)

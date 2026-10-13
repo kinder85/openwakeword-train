@@ -68,6 +68,15 @@ These recordings become the **real negatives** and the background-noise
 context for the positives — this is what removes false positives in real use.
 They are requested only once and reused by every training run.
 
+The script then offers to download the **openWakeWord generic negatives**
+(pre-computed ACAV100M features, ~2000 h of varied real audio) — ~800 MB, once.
+This is by far the strongest lever against false positives: a few hundred
+negatives become ~200,000, with no encoding on your side. You can decline
+(`--no-oww`), skip the prompt (`--oww`), or change the amount (`--oww-rows 100000`).
+Folder: `openwakeword_features/` (never purged). Details, troubleshooting and manual
+re-download: [`docs/NEGATIFS-OPENWAKEWORD.md`](docs/NEGATIFS-OPENWAKEWORD.md)
+(or the GUI, dedicated panel).
+
 ### Graphical interface
 
 ```bash
@@ -200,7 +209,8 @@ trainer.py            full pipeline (generation → embeddings → training → 
 trainer_gui.py        bilingual graphical interface (fr/en)
 onnx_to_tflite.py     .onnx → .tflite conversion (int8 + float32) post-training
 first_run.py          download of missing models (vosk per language + openWakeWord)
-first_run_train.py    first run: packages + models + real recordings + split
+first_run_train.py    first run: packages + models + real recordings + openWakeWord generic negatives + split
+telecharger_negatifs_openwakeword.py  (re)download the generic negatives (ACAV100M) — see docs/NEGATIFS-OPENWAKEWORD.md
 capture_ambiance_tv.py capture of real TV/background noise (real negatives)
 vosk_helper.py        vosk model lookup per language + transcription
 requirements-train.txt  all dependencies (single install)

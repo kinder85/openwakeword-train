@@ -620,7 +620,7 @@ def make_silence_windows(n, seed=0):
 
 
 def build_windows(pos_paths, neg_paths, augmenter=None, seed=0, stride=2,
-                  n_silence=None):
+                  n_silence=None, oww_neg_features=None):
     """Construit les fenêtres d'embeddings + labels.
 
     Alignement streaming : les 9 premières trames batch (warm-up, sans
@@ -695,6 +695,13 @@ def build_windows(pos_paths, neg_paths, augmenter=None, seed=0, stride=2,
     X = np.stack(X).astype(np.float32)
     y = np.array(y, dtype=np.int32)
     g = np.array(g, dtype=np.int32)
+    # negatifs generiques pre-calcules (ACAV100M) : bloc ajoute d'un coup (evite
+    # des dizaines de milliers d'objets Python) et marque en TRAIN uniquement.
+    if oww_neg_features is not None and len(oww_neg_features):
+        O = np.asarray(oww_neg_features, dtype=np.float32)
+        X = np.concatenate([X, O], axis=0)
+        y = np.concatenate([y, np.zeros(len(O), dtype=np.int32)])
+        g = np.concatenate([g, GROUP_BASE_OWW + np.arange(len(O), dtype=np.int32)])
     order = rng.permutation(len(y))
     return X[order], y[order], g[order]
 
@@ -774,7 +781,12 @@ class WakeClassifier:
         # Validation par CLIP quand les groupes sont fournis : pas de fuite
         # train/val entre fenetres d'un meme enregistrement.
         if groups is not None:
+            # les features generiques openWakeWord (id >= GROUP_BASE_OWW) restent
+            # TOUJOURS en entrainement : la validation reste dominee par nos clips.
             gu = np.unique(groups)
+            gu = gu[gu < GROUP_BASE_OWW]
+            if len(gu) == 0:
+                gu = np.unique(groups)
             nval = max(1, int(round(len(gu) * val_split)))
             val_groups = rng.choice(gu, size=nval, replace=False)
             mask_val = np.isin(groups, val_groups)
@@ -1061,10 +1073,54 @@ def real_negative_paths():
     return sorted(glob.glob(os.path.join(clips_dir, "real_*.wav")))
 
 
+# ---- negatifs generiques openWakeWord (features PRE-CALCULEES) ----
+# Dataset public davidscripka/openwakeword_features : features deja calculees par
+# l'embedding Google, au format EXACT d'entree du DNN (16, 96) -- evite de
+# collecter/decouper des milliers d'heures d'audio negatif.
+#   * acav100m_200k.npy           : 200 000 fenetres (~71 h) float16 (ACAV100M)
+#   * validation_set_features.npy : ~11 h reelles en FLUX PLAT (N, 96) a fenetrer
+# Dossier defini par OWW_FEATURES_DIR (defaut : ./openwakeword_features).
+OWW_FEATURES_DIR = os.environ.get("OWW_FEATURES_DIR", "openwakeword_features")
+OWW_ACAV_NPY = os.path.join(OWW_FEATURES_DIR, "acav100m_200k.npy")
+OWW_VALIDATION_NPY = os.path.join(OWW_FEATURES_DIR, "validation_set_features.npy")
+# Les fenetres OWW portent un id de groupe >= cette borne : elles restent
+# TOUJOURS en entrainement (jamais en validation) -- sinon la validation serait
+# noyee sous les negatifs generiques et l'early stopping optimiserait a tort.
+GROUP_BASE_OWW = 10 ** 7
+
+
+def charger_features_oww(path, n=None, seed=0):
+    """Charge jusqu'a `n` fenetres (16, 96) float32 depuis un .npy de features
+    openWakeWord pre-calculees (lecture mmap -> empreinte memoire maitrisee).
+
+    `n=None` -> tout le fichier. Renvoie (k, 16, 96) float32, ou un tableau vide
+    si le fichier est absent/illisible.
+    """
+    vide = np.zeros((0, N_FRAMES, EMBED_DIM), dtype=np.float32)
+    if not path or not os.path.exists(path):
+        return vide
+    try:
+        arr = np.load(path, mmap_mode="r")
+    except Exception:
+        return vide
+    if arr.ndim == 3 and tuple(arr.shape[1:]) == (N_FRAMES, EMBED_DIM):
+        total = arr.shape[0]
+    elif arr.ndim == 2 and arr.shape[1] == N_FRAMES * EMBED_DIM:
+        arr = arr.reshape(-1, N_FRAMES, EMBED_DIM)
+        total = arr.shape[0]
+    else:
+        return vide
+    if n is None or n >= total:
+        idx = np.arange(total)
+    else:
+        idx = np.sort(np.random.default_rng(seed).choice(int(total), size=int(n), replace=False))
+    return np.ascontiguousarray(np.asarray(arr[idx], dtype=np.float32))
+
+
 def train_model(phrase, pos_paths, neg_paths, out_name, out_dir="openwakeword",
                 threshold=0.5, tokens=None, epochs=100, seed=0, progress_cb=None,
                 log_cb=None, with_tflite=True, neg_weight=1.0, with_int8=True,
-                wd=1e-3, patience=15):
+                wd=1e-3, patience=15, n_neg_oww=None):
     """Pipeline complet : fenêtres → embeddings → entraînement → export .onnx + JSON.
 
     `with_tflite=False` : ne produit que le .onnx (pas de .tflite int8/float32),
@@ -1086,8 +1142,22 @@ def train_model(phrase, pos_paths, neg_paths, out_name, out_dir="openwakeword",
         log("Négatifs réels du micro inclus : %d clips" % len(real))
         neg_paths = list(neg_paths) + real
 
+    # negatifs generiques pre-calcules (ACAV100M) -- levier principal contre les
+    # faux positifs. Toujours en TRAIN. `n_neg_oww=0` desactive ; None = tout.
+    oww_neg = None
+    if n_neg_oww != 0 and os.path.exists(OWW_ACAV_NPY):
+        oww_neg = charger_features_oww(OWW_ACAV_NPY, n=n_neg_oww, seed=seed)
+        if len(oww_neg):
+            log("Negatifs generiques openWakeWord (ACAV100M) : %d fenetres (~%.1f h)"
+                % (len(oww_neg), len(oww_neg) * N_FRAMES / 12.5 / 3600.0))
+        else:
+            log("features ACAV100M presentes mais illisibles -- sans.")
+    else:
+        log("Negatifs generiques openWakeWord absents (%s) -- sans." % OWW_ACAV_NPY)
+
     log("Découpe en fenêtres d'embeddings + augmentation…")
-    X, y, groups = build_windows(pos_paths, neg_paths, augmenter, seed=seed)
+    X, y, groups = build_windows(pos_paths, neg_paths, augmenter, seed=seed,
+                                 oww_neg_features=oww_neg)
     log("Jeu de donnees : %d fenetres (%d positives, %d negatives, %d clips)"
         % (len(y), int(y.sum()), int((y == 0).sum()), int(len(np.unique(groups)))))
 
@@ -1173,6 +1243,35 @@ def train_model(phrase, pos_paths, neg_paths, out_name, out_dir="openwakeword",
         % (results["pos_score_mean"], results["neg_score_mean"],
            results["silence_score_mean"], results["silence_score_max"]))
 
+    # --- validation FAUX POSITIFS sur le jeu openWakeWord (~11 h reelles) ---
+    # Flux PLAT (N, 96) -> fenetres par glissement d'1 trame. Echantillon de k
+    # fenetres -> taux de faux positifs/heure au seuil.
+    if os.path.exists(OWW_VALIDATION_NPY):
+        try:
+            stream = np.load(OWW_VALIDATION_NPY, mmap_mode="r")
+            n_win = int(stream.shape[0]) - N_FRAMES
+            if n_win > 0:
+                k = min(1500, n_win)
+                starts = np.sort(np.random.default_rng(seed + 7).choice(
+                    n_win, size=k, replace=False))
+                fp_scores = []
+                for st in starts:
+                    w = np.asarray(stream[int(st):int(st) + N_FRAMES], dtype=np.float32)
+                    out = sess.run(None, {"input": w[None]})[0]
+                    fp_scores.append(float(np.asarray(out).ravel()[0]))
+                fp_scores = np.array(fp_scores)
+                hours = k * 0.08 / 3600.0  # 1 trame = 80 ms de flux nouveau
+                fp_hour = float((fp_scores >= threshold).sum()) / max(hours, 1e-9)
+                results["fp_val_max"] = float(fp_scores.max())
+                results["fp_val_mean"] = float(fp_scores.mean())
+                results["fp_val_n"] = int(k)
+                results["fp_val_per_hour"] = fp_hour
+                log("Validation FAUX POSITIFS (openWakeWord ~11 h) : max %.3f "
+                    "(moyenne %.3f ; %d fenetres) -> ~%.0f faux positifs/heure au seuil %.2f"
+                    % (fp_scores.max(), fp_scores.mean(), k, fp_hour, threshold))
+        except Exception as e:
+            log("validation faux positifs ignoree : %s" % e)
+
     # --- validation STREAMING (chemin d'inférence réel du runtime) ---
     from openwakeword.model import Model
     import inspect
@@ -1224,11 +1323,12 @@ def train_model(phrase, pos_paths, neg_paths, out_name, out_dir="openwakeword",
     log("Validation streaming NEGATIFS : max %.3f (moyenne %.3f ; %d/%d clips >= seuil %.2f)"
         % (results["stream_neg_max"], results["stream_neg_mean"], n_fp,
            len(neg_stream), threshold))
-    if results["stream_neg_max"] >= threshold:
-        seuil = min(0.95, round(max(results["stream_neg_max"],
-                                    results["silence_score_max"]) + 0.05, 2))
+    if results["stream_neg_max"] >= threshold or results.get("fp_val_max", 0.0) >= threshold:
+        pic = max(results["stream_neg_max"], results["silence_score_max"],
+                  results.get("fp_val_max", 0.0))
+        seuil = min(0.95, round(pic + 0.05, 2))
         results["seuil_suggere"] = seuil
-        log("des clips negatifs atteignent le seuil %.2f — seuil suggere >= %.2f"
+        log("⚠ des negatifs atteignent le seuil %.2f — seuil suggere >= %.2f"
             % (threshold, seuil))
     log("Modèle prêt — auto-découvert au prochain lancement de la GUI.")
     return results
