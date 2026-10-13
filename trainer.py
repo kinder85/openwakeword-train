@@ -290,10 +290,33 @@ def list_french_voices():
     return list_voices("fr")
 
 
+# Microsoft migre la synthese Read Aloud de speech.platform.bing.com (v1) vers
+# api.msedgeservices.com (v2) : les noeuds v2 rejettent le handshake v1 en 403
+# (cf. rany2/edge-tts#490, octobre 2026). On pointe le WSS sur v2 -- le jeton
+# client v1 reste accepte -- avec repli sur v1 dans _tts_one.
+_TTS_WSS_V2 = ("wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1"
+               "?Ocp-Apim-Subscription-Key=%s")
+
+
+def _edge_tts_wss_v2():
+    import edge_tts.constants as _k
+    return _TTS_WSS_V2 % _k.TRUSTED_CLIENT_TOKEN
+
+
 async def _tts_one(text, voice, out_mp3, rate, pitch):
+    import aiohttp
     import edge_tts
-    com = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
-    await com.save(out_mp3)
+    import edge_tts.communicate as _c
+    import edge_tts.constants as _k
+    v1 = _k.WSS_URL  # endpoint historique (speech.platform.bing.com)
+    _c.WSS_URL = _k.WSS_URL = _edge_tts_wss_v2()
+    try:
+        com = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+        await com.save(out_mp3)
+    except aiohttp.client_exceptions.WSSServerHandshakeError:
+        _c.WSS_URL = _k.WSS_URL = v1
+        com = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+        await com.save(out_mp3)
 
 
 def _mp3_to_16k(mp3_path):
@@ -381,6 +404,30 @@ HOMOPHONES = {
 }
 
 
+# Syllabes sans signification pour fabriquer des negatifs « babillage » : des
+# suites de syllabes proches de la cible que le modele doit rejeter (type
+# « blablabla »). Le TTS les prononce ; ca comble le trou des negatifs reels.
+BABBLE_SYLLABLES = {
+    "fr": ["bla", "na", "la", "ta", "pa", "ka", "tra", "fou", "gni", "pou",
+           "mi", "zo", "ra", "chou", "gri", "da", "sa", "ba"],
+    "en": ["bla", "na", "la", "ta", "pa", "ka", "tra", "foo", "ni", "poo",
+           "mi", "zo", "ra", "sha", "gri", "da", "sa", "ba"],
+}
+
+
+def babble_sentences(k, lang="fr", seed=0):
+    """k chaines de babillage (3-6 syllabes) -- negatifs proches et varies."""
+    rng = random.Random(seed + 7)
+    syl = BABBLE_SYLLABLES.get(lang, BABBLE_SYLLABLES["fr"])
+    out = set()
+    tries = 0
+    while len(out) < k and tries < k * 20:
+        tries += 1
+        m = rng.randint(3, 6)
+        out.add("".join(rng.choice(syl) for _ in range(m)))
+    return sorted(out)
+
+
 def confusable_negatives(phrase, lang="fr"):
     """Dérive des variantes phonétiquement proches de la phrase cible, de façon
     générique (marche pour n'importe quel wake word) :
@@ -423,6 +470,10 @@ def generate_negatives(n, out_dir, lang="fr", voices=None, progress_cb=None, phr
     # les confusables dérivés de la phrase cible sont TOUJOURS inclus (en tête) ;
     # la liste générique complète le quota jusqu'à n.
     sentences = list(confusable_negatives(phrase, lang)) if phrase else []
+    bab = babble_sentences(max(2, n // 4), lang, seed=0)
+    if len(sentences) + len(bab) > n:
+        sentences = sentences[:max(0, n - len(bab))]
+    sentences += bab
     base = NEGATIVE_SENTENCES[lang]
     while len(sentences) < n:
         sentences.append(rng.choice(base))
@@ -585,19 +636,18 @@ def build_windows(pos_paths, neg_paths, augmenter=None, seed=0, stride=2,
     ambient = lambda n: ambient_clip(n, rng)
 
     def windows_from(e, lo, hi):
-        """Fenêtres de 16 trames dont le centre est dans [lo, hi] (frames)."""
+        """Toutes les fenetres de 16 trames dont le centre est dans [lo, hi]."""
         F = len(e)
-        out = []
         if F < N_FRAMES + WARMUP_FRAMES:
-            return out
+            return []
         centers = [s for s in range(WARMUP_FRAMES, F - N_FRAMES + 1)
                    if lo <= s + N_FRAMES // 2 <= hi]
         if not centers:
             centers = [max(WARMUP_FRAMES, min(int(lo) - N_FRAMES // 2, F - N_FRAMES))]
-        step = max(1, len(centers) // 5)
-        return out + centers[::step][:5]
+        return centers
 
-    X, y = [], []
+    X, y, g = [], [], []
+    gid = 0
     for p in pos_paths:
         a = load_wav_16k(p)
         pre = ambient(int(SR * 1.5))
@@ -613,6 +663,12 @@ def build_windows(pos_paths, neg_paths, augmenter=None, seed=0, stride=2,
         for s in windows_from(e, center - half_span, center + half_span):
             X.append(e[s:s + N_FRAMES])
             y.append(1)
+            g.append(gid)
+        for s in range(0, min(WARMUP_FRAMES, max(0, F - N_FRAMES + 1))):
+            X.append(e[s:s + N_FRAMES])
+            y.append(0)
+            g.append(gid)
+        gid += 1
     for p in neg_paths:
         a = load_wav_16k(p)
         if len(a) < int(SR * 4.0):
@@ -620,18 +676,27 @@ def build_windows(pos_paths, neg_paths, augmenter=None, seed=0, stride=2,
         if augmenter is not None:
             a = augmenter(a, sample_rate=SR)
         e = compute_embeddings(a[None, :])[0]
+        for s in range(0, min(WARMUP_FRAMES, max(0, len(e) - N_FRAMES + 1))):
+            X.append(e[s:s + N_FRAMES])
+            y.append(0)
+            g.append(gid)
         for s in range(WARMUP_FRAMES, len(e) - N_FRAMES + 1, stride):
             X.append(e[s:s + N_FRAMES])
             y.append(0)
+            g.append(gid)
+        gid += 1
     n_silence = n_silence if n_silence is not None else len(pos_paths) * 2
     if n_silence > 0:
         for w in make_silence_windows(n_silence, seed=seed):
             X.append(w)
             y.append(0)
+            g.append(gid)
+            gid += 1
     X = np.stack(X).astype(np.float32)
     y = np.array(y, dtype=np.int32)
+    g = np.array(g, dtype=np.int32)
     order = rng.permutation(len(y))
-    return X[order], y[order]
+    return X[order], y[order], g[order]
 
 
 # ---------------------------------------------------------------- features
@@ -702,12 +767,21 @@ class WakeClassifier:
 
     # ---- entraînement (Adam, BCE)
     def fit(self, X, y, epochs=40, batch_size=128, lr=1e-3, wd=1e-4,
-            val_split=0.15, progress_cb=None, seed=0, neg_weight=1.0):
+            val_split=0.15, progress_cb=None, seed=0, neg_weight=1.0,
+            groups=None, patience=15, min_epochs=10):
         rng = np.random.default_rng(seed)
         y = y.astype(np.float32)
-        idx_val = rng.choice(len(y), size=max(8, int(len(y) * val_split)), replace=False)
-        mask_val = np.zeros(len(y), dtype=bool)
-        mask_val[idx_val] = True
+        # Validation par CLIP quand les groupes sont fournis : pas de fuite
+        # train/val entre fenetres d'un meme enregistrement.
+        if groups is not None:
+            gu = np.unique(groups)
+            nval = max(1, int(round(len(gu) * val_split)))
+            val_groups = rng.choice(gu, size=nval, replace=False)
+            mask_val = np.isin(groups, val_groups)
+        else:
+            idx_val = rng.choice(len(y), size=max(8, int(len(y) * val_split)), replace=False)
+            mask_val = np.zeros(len(y), dtype=bool)
+            mask_val[idx_val] = True
         Xtr, ytr = X[~mask_val], y[~mask_val]
         Xva, yva = X[mask_val], y[mask_val]
 
@@ -730,6 +804,10 @@ class WakeClassifier:
                 - xhat * (dxhat * xhat).mean(axis=1, keepdims=True))
             return dz, dg, dbeta
 
+        best_loss = float("inf")
+        best = None
+        best_epoch = 0
+        bad = 0
         for epoch in range(epochs):
             order = rng.permutation(len(ytr))
             total_loss = 0.0
@@ -772,14 +850,32 @@ class WakeClassifier:
                     vh = v[pi] / (1 - 0.999 ** t)
                     p_ -= lr * mh / (np.sqrt(vh) + 1e-8)
 
+            pv = self.predict_proba(Xva)
+            ev = 1e-7
+            val_loss = float(-(yva * np.log(pv + ev) + (1 - yva) * np.log(1 - pv + ev)).mean()) \
+                if len(yva) else 0.0
             if progress_cb:
-                pv = self.predict_proba(Xva)
-                info = {
+                progress_cb({
                     "epoch": epoch + 1, "loss": total_loss / len(ytr),
+                    "val_loss": val_loss,
                     "val_pos": float(pv[yva == 1].mean()) if (yva == 1).any() else 0.0,
                     "val_neg": float(pv[yva == 0].mean()) if (yva == 0).any() else 0.0,
-                }
-                progress_cb(info)
+                })
+            if val_loss < best_loss - 1e-4:
+                best_loss = val_loss
+                best_epoch = epoch + 1
+                bad = 0
+                best = [p_.copy() for p_ in params]
+            else:
+                bad += 1
+                if (epoch + 1) >= min_epochs and bad >= patience:
+                    if progress_cb:
+                        progress_cb({"early_stop": True, "epoch": epoch + 1,
+                                     "best_epoch": best_epoch, "best_loss": best_loss})
+                    break
+        if best is not None:
+            for p_, b_ in zip(params, best):
+                p_[...] = b_
 
     # ---- export onnx
     def export_onnx(self, out_path, model_name):
@@ -841,7 +937,7 @@ class WakeClassifier:
 
 # ---------------------------------------------------------------- export tflite
 def export_tflite(onnx_path, calibration_X, out_path, model_name,
-                  quant_type="per-tensor", log_cb=None):
+                  quant_type="per-tensor", log_cb=None, with_int8=True):
     """Convertit le .onnx exporté en .tflite (int8 + float32).
 
     Destiné à Home Assistant / ESPHome / ESP32 (leur runtime tflite), pas au
@@ -904,14 +1000,17 @@ def export_tflite(onnx_path, calibration_X, out_path, model_name,
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         ok = False
 
-        # int8 full : <stem>_full_integer_quant.tflite → <name>.tflite
-        int8_candidates = glob.glob(os.path.join(out_folder, "*_full_integer_quant.tflite"))
-        if int8_candidates:
-            shutil.copyfile(int8_candidates[0], out_path)
-            log("Export .tflite int8 : " + out_path)
-            ok = True
+        if with_int8:
+            # int8 full : <stem>_full_integer_quant.tflite → <name>.tflite
+            int8_candidates = glob.glob(os.path.join(out_folder, "*_full_integer_quant.tflite"))
+            if int8_candidates:
+                shutil.copyfile(int8_candidates[0], out_path)
+                log("Export .tflite int8 : " + out_path)
+                ok = True
+            else:
+                log("⚠ export .tflite : aucun fichier full_integer_quant produit.")
         else:
-            log("⚠ export .tflite : aucun fichier full_integer_quant produit.")
+            log("Export .tflite int8 ignoré (with_int8=False) — on garde le float32.")
 
         # float32 : <stem>_float32.tflite → <name>_float32.tflite
         f32_candidates = glob.glob(os.path.join(out_folder, "*_float32.tflite"))
@@ -919,6 +1018,7 @@ def export_tflite(onnx_path, calibration_X, out_path, model_name,
             f32_path = os.path.splitext(out_path)[0] + "_float32.tflite"
             shutil.copyfile(f32_candidates[0], f32_path)
             log("Export .tflite float32 : " + f32_path)
+            ok = ok or True
         else:
             log("⚠ export .tflite : aucun fichier float32 produit.")
 
@@ -963,7 +1063,8 @@ def real_negative_paths():
 
 def train_model(phrase, pos_paths, neg_paths, out_name, out_dir="openwakeword",
                 threshold=0.5, tokens=None, epochs=100, seed=0, progress_cb=None,
-                log_cb=None, with_tflite=True, neg_weight=1.0):
+                log_cb=None, with_tflite=True, neg_weight=1.0, with_int8=True,
+                wd=1e-3, patience=15):
     """Pipeline complet : fenêtres → embeddings → entraînement → export .onnx + JSON.
 
     `with_tflite=False` : ne produit que le .onnx (pas de .tflite int8/float32),
@@ -986,17 +1087,25 @@ def train_model(phrase, pos_paths, neg_paths, out_name, out_dir="openwakeword",
         neg_paths = list(neg_paths) + real
 
     log("Découpe en fenêtres d'embeddings + augmentation…")
-    X, y = build_windows(pos_paths, neg_paths, augmenter, seed=seed)
-    log("Jeu de données : %d fenêtres (%d positives, %d négatives)" % (len(y), int(y.sum()), int((y == 0).sum())))
+    X, y, groups = build_windows(pos_paths, neg_paths, augmenter, seed=seed)
+    log("Jeu de donnees : %d fenetres (%d positives, %d negatives, %d clips)"
+        % (len(y), int(y.sum()), int((y == 0).sum()), int(len(np.unique(groups)))))
 
     model = WakeClassifier(seed=seed)
 
     def cb(info):
-        log("epoch %2d/%d — loss %.4f — score val: pos %.3f / neg %.3f"
-            % (info["epoch"], epochs, info["loss"], info["val_pos"], info["val_neg"]))
+        if info.get("early_stop"):
+            log("Arret anticipe epoch %d — meilleur epoch %d (val %.4f) restaure."
+                % (info["epoch"], info.get("best_epoch", info["epoch"]),
+                   info.get("best_loss", 0.0)))
+            return
+        log("epoch %2d/%d — loss %.4f — val %.4f — score val: pos %.3f / neg %.3f"
+            % (info["epoch"], epochs, info["loss"], info.get("val_loss", 0.0),
+               info["val_pos"], info["val_neg"]))
 
     log("Entraînement (%d epochs)…" % epochs)
-    model.fit(X, y, epochs=epochs, progress_cb=cb, seed=seed, neg_weight=neg_weight)
+    model.fit(X, y, epochs=epochs, progress_cb=cb, seed=seed, neg_weight=neg_weight,
+              groups=groups, wd=wd, patience=patience)
 
     onnx_path = os.path.join(out_dir, out_name + ".onnx")
     log("Export : " + onnx_path)
@@ -1005,7 +1114,7 @@ def train_model(phrase, pos_paths, neg_paths, out_name, out_dir="openwakeword",
     # export .tflite int8/float32 (optionnel, pour HA/ESPHome/ESP32) — même pesée
     tflite_path = os.path.join(out_dir, out_name + ".tflite")
     if with_tflite:
-        export_tflite(onnx_path, X, tflite_path, out_name, log_cb=log)
+        export_tflite(onnx_path, X, tflite_path, out_name, log_cb=log, with_int8=with_int8)
     else:
         log("Export .tflite ignoré (option désactivée) — seul le .onnx est produit.")
 
@@ -1093,7 +1202,34 @@ def train_model(phrase, pos_paths, neg_paths, out_name, out_dir="openwakeword",
     log("Validation streaming : « %s » max %.3f (moyenne %.3f sur %d échantillons)"
         % (phrase, results["stream_pos_max"], results["stream_pos_mean"], len(pos_stream)))
     if results["stream_pos_max"] < threshold:
-        log("⚠ le wake word n'atteint pas le seuil en streaming — vérifier l'alignement")
+        log("le wake word n'atteint pas le seuil en streaming — verifier l'alignement")
+
+    # validation streaming des NEGATIFS (faux positifs) : le controle qui manquait.
+    neg_stream_paths = list(neg_paths)
+    neg_stream = []
+    if neg_stream_paths:
+        rngn = np.random.default_rng(seed + 3)
+        for p in rngn.choice(neg_stream_paths,
+                             min(8, len(neg_stream_paths)), replace=False):
+            a = load_wav_16k(p)
+            a16 = (np.clip(a, -1, 1) * 32767).astype(np.int16)
+            sc = stream_scores(a16)
+            if sc:
+                neg_stream.append(max(sc))
+    results["stream_neg_max"] = float(np.max(neg_stream)) if neg_stream else 0.0
+    results["stream_neg_mean"] = float(np.mean(neg_stream)) if neg_stream else 0.0
+    n_fp = int(sum(1 for v in neg_stream if v >= threshold))
+    results["stream_neg_fp"] = n_fp
+    results["stream_neg_n"] = len(neg_stream)
+    log("Validation streaming NEGATIFS : max %.3f (moyenne %.3f ; %d/%d clips >= seuil %.2f)"
+        % (results["stream_neg_max"], results["stream_neg_mean"], n_fp,
+           len(neg_stream), threshold))
+    if results["stream_neg_max"] >= threshold:
+        seuil = min(0.95, round(max(results["stream_neg_max"],
+                                    results["silence_score_max"]) + 0.05, 2))
+        results["seuil_suggere"] = seuil
+        log("des clips negatifs atteignent le seuil %.2f — seuil suggere >= %.2f"
+            % (threshold, seuil))
     log("Modèle prêt — auto-découvert au prochain lancement de la GUI.")
     return results
 
